@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Downtown Sioux Falls, SD Buildings</title>
+
+  <!-- CesiumJS from a CDN, pinned to an exact version -->
+  <script src="https://cdn.jsdelivr.net/npm/cesium@1.146.0/Build/Cesium/Cesium.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/cesium@1.146.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+
+  <style>
+    html, body, #cesiumContainer { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; }
+
+    /* ---- Control panel (top-left) ---- */
+    #panel {
+      position: absolute; top: 10px; left: 10px; z-index: 1;
+      width: 270px; max-width: calc(100% - 20px); max-height: calc(100% - 20px);
+      overflow-y: auto; box-sizing: border-box;
+      background: rgba(255, 255, 255, 0.95); color: #222;
+      font: 13px/1.4 sans-serif; padding: 10px 12px; border-radius: 6px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+    }
+    #panel h2 { margin: 0; font-size: 15px; }
+    #panel h3 { margin: 12px 0 4px; font-size: 13px; border-top: 1px solid #ddd; padding-top: 8px; }
+    #panel label { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+    #panel input[type=range] { width: 100%; margin: 0; }
+    #panel select, #panel button { font: inherit; width: 100%; padding: 3px; }
+    #panel .row { display: flex; justify-content: space-between; align-items: center; }
+    #panel .muted { color: #666; font-size: 12px; }
+    #panel input[type=color] { width: 26px; height: 20px; padding: 0; border: 1px solid #999; }
+    #panel .swatch { width: 16px; height: 16px; border: 1px solid #232323; display: inline-block; flex: none; }
+    #panel .typeRow { display: flex; align-items: center; gap: 6px; }
+    #panel .typeRow label { flex: 1; }
+    #toggle { width: auto !important; padding: 1px 8px !important; }
+    #panel.collapsed #controls { display: none; }
+    [hidden] { display: none !important; }  /* keep hidden items hidden, even flex labels */
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+
+  <div id="panel">
+    <div class="row">
+      <h2>Downtown Buildings</h2>
+      <button id="toggle" title="Show or hide the controls">Hide</button>
+    </div>
+    <div id="controls">
+      <div class="muted" id="count">Loading buildings...</div>
+
+      <h3>Color buildings by</h3>
+      <select id="colorMode">
+        <option value="stories">Number of stories</option>
+        <option value="type">Building type</option>
+        <option value="single">One color for all</option>
+      </select>
+      <label id="singleColorRow" hidden>Building color <input type="color" id="singleColor" value="#3388ff"></label>
+      <div id="storiesLegend"></div>
+      <div class="row"><span>Transparency</span><span id="alphaOut">0%</span></div>
+      <input type="range" id="alpha" min="0" max="80" step="5" value="0">
+
+      <h3>Building height (ft)</h3>
+      <div class="row"><span>Min</span><span id="hMinOut"></span></div>
+      <input type="range" id="hMin" step="1">
+      <div class="row"><span>Max</span><span id="hMaxOut"></span></div>
+      <input type="range" id="hMax" step="1">
+
+      <h3>Number of stories</h3>
+      <div class="row"><span>Min</span><span id="sMinOut"></span></div>
+      <input type="range" id="sMin" step="1">
+      <div class="row"><span>Max</span><span id="sMaxOut"></span></div>
+      <input type="range" id="sMax" step="1">
+
+      <h3>Building type</h3>
+      <div class="muted">Uncheck to hide. Click a color box to change that type's color.</div>
+      <div id="typeList"></div>
+
+      <h3></h3>
+      <button id="reset">Reset all</button>
+    </div>
+  </div>
+
+  <script>
+    // Your Cesium ion token (ion.cesium.com -> Access Tokens).
+    // Anyone can read it on a public page, so in the ion dashboard
+    // restrict it to your GitHub Pages URL before publishing.
+    // Without a token you get a flat globe.
+    // Token "SF_Orditus_GitHub" expires May 17, 2027: make a new one before then.
+    const token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6Im1Wa1NOZTF5dmdoVUdkM1UiLCJqdGkiOiJhMWNhMGJmOC1jODkxLTRkMGItODg1Mi1lNDIzYWJmNjA3ZGEiLCJpZCI6NTQ2NzUwLCJzdWIiOiJUYm9uZTA5MzUiLCJpc3MiOiJodHRwczovL2FwaS5jZXNpdW0uY29tIiwiYXVkIjoiU0ZfT3JkaXR1c19HaXRIdWIiLCJpYXQiOjE3OTQ5NTU3NTgsImV4cCI6MTgxMDU4OTkzM30.F4_5YDS3jxNEj-UXrEDLNqG6OSvuyPAoacYyWDFdHjU";
+    const hasToken = !token.startsWith("PASTE");
+    if (hasToken) Cesium.Ion.defaultAccessToken = token;
+
+    // The 3D globe: OpenStreetMap streets, draped over Cesium's world terrain
+    // when there's a token (a flat globe without one).
+    const viewer = new Cesium.Viewer("cesiumContainer", {
+      terrain: hasToken ? Cesium.Terrain.fromWorldTerrain() : undefined,
+      baseLayer: new Cesium.ImageryLayer(
+        new Cesium.OpenStreetMapImageryProvider({ url: "https://tile.openstreetmap.org/" })
+      ),
+      baseLayerPicker: false,
+      animation: false,   // no clock widgets: this map has no time data
+      timeline: false,
+    });
+
+    // ---------------------------------------------------------------------
+    // Color settings
+    // ---------------------------------------------------------------------
+
+    // Graduated colors copied from the QGIS project
+    // "1st Attempt Application.qgz", layer "Graduated Colors"
+    // (field NUMBERSTORIES, Natural Breaks / Jenks).
+    // QGIS rule: a building is in a class if lower < stories <= upper
+    // (the first class also includes its lower value).
+    const storyClasses = [
+      { lower: 1, upper: 1,  label: "1 Story",      color: "#ffffb2" },
+      { lower: 1, upper: 2,  label: "2 Stories",    color: "#fecc5c" },
+      { lower: 2, upper: 4,  label: "3-4 Stories",  color: "#fd8d3c" },
+      { lower: 4, upper: 7,  label: "5-7 Stories",  color: "#f03b20" },
+      { lower: 7, upper: 11, label: "8-11 Stories", color: "#bd0026" },
+    ];
+
+    function storiesColor(stories) {
+      const match = storyClasses.find((c, i) =>
+        (i === 0 ? stories >= c.lower : stories > c.lower) && stories <= c.upper);
+      return match ? match.color : "#a0a0a0"; // gray if outside every class
+    }
+
+    // Building types. The City's STRUCTURE codes are grouped by hundreds
+    // (1xx = residential, 5xx = commercial, ...). Users can change these colors.
+    const typeGroups = {
+      1: { label: "Residential",                color: "#009e73" },
+      2: { label: "Multi-Family Residential",   color: "#56b4e9" },
+      3: { label: "Office & Government",        color: "#0072b2" },
+      4: { label: "Institutional & Community",  color: "#cc79a7" },
+      5: { label: "Commercial & Retail",        color: "#e69f00" },
+      6: { label: "Industrial",                 color: "#d55e00" },
+      7: { label: "Green Space Structure",      color: "#7f7f7f" },
+      9: { label: "Rural",                      color: "#a6761d" },
+    };
+
+    // Names for the City's STRUCTURE codes, from the City's building layer
+    // (gis.siouxfalls.gov ... Data/Property/MapServer/5, domain WS1_StructureCodeType).
+    const structureNames = {
+      110: "Single Family Home", 121: "Twin Home", 122: "Townhome - 3 or more units",
+      130: "Accessory Housing Unit", 140: "Manufactured Housing",
+      150: "Other Specialized Residential Structure", 151: "Barracks", 152: "Dormitory",
+      190: "Single Family Accessory Structure", 210: "Duplex",
+      220: "Multi-Family - 3 or more units", 230: "Multi-family Community Building",
+      290: "Multi-Family Accessory Structure", 310: "Office - 1 tenant",
+      311: "Office - 1 tenant with drive-thru", 320: "Bank", 321: "Bank with drive-thru",
+      330: "Office - 2 or more tenants", 331: "Office - 2 or more tenants with drive-thru",
+      350: "Government Administration Building", 361: "Jail, Penitentiary, or Juvenile Detention",
+      362: "Bus Stop or Transfer Facility", 363: "Public Safety", 364: "Air Terminal",
+      365: "Bus Maintenance Facility", 366: "Post Office",
+      367: "Government Maintenance/Storage Shop", 370: "Covered or Multi-Story Parking Ramp",
+      380: "Neighborhood Public Utilities", 390: "Office or Public Service Accessory Structure",
+      410: "Public Assembly Structure", 411: "Indoor Games Facility",
+      412: "Outdoor Games Facility", 413: "Convention Center", 414: "Other Community Structure",
+      420: "House of Worship or Cemetery Structure", 431: "Hospital",
+      432: "Large Medical Clinic", 433: "Nursing Home", 434: "Assisted Living",
+      435: "Group Home", 436: "Funeral Home", 440: "Daycare Center",
+      451: "School - Elementary or Secondary", 452: "School - College or University",
+      453: "School - Trade or Specialty", 461: "Library", 462: "Museum", 463: "Zoo",
+      470: "Health Club or Gymnastics Center", 480: "Human Services Facility",
+      490: "Institutional Accessory Structure", 511: "General Retail or Services",
+      512: "Gas Station or Auto Service", 513: "Grocery Store",
+      514: "Restaurant, Bar, or Lounge", 515: "Hotel, Motel, or Resort", 516: "Movie Theater",
+      520: "Mixed Use - Suburban", 530: "Mixed Use - Downtown/Village", 531: "Strip Mall",
+      532: "Community Commercial Center (not enclosed)", 533: "Regional Commercial Center",
+      534: "Super-Regional Commercial Center", 590: "Commercial Accessory Structure",
+      620: "Light Assembly and Processing", 630: "Heavy Industrial",
+      631: "Assembly or Construction-type Plant", 632: "Processing Plant",
+      641: "Mini-Storage", 642: "Warehouse", 643: "Tank Structure", 651: "Railroad Facility",
+      652: "Landfill", 653: "Incinerator", 654: "Hazardous Waste Facility",
+      655: "Sewer or Water Treatment Plant", 656: "Air Transportation Facility",
+      657: "Tower or Related facility", 690: "Industrial Accessory Structure",
+      710: "Green Space Primary Structure", 790: "Green Space Accessory Structure",
+      990: "Rural Structure",
+    };
+
+    // Cesium works in meters, but the data is in feet.
+    // Heights are converted only for drawing; everything shown stays in feet.
+    const FEET_TO_METERS = 0.3048;
+
+    // ---------------------------------------------------------------------
+    // Load the buildings
+    // ---------------------------------------------------------------------
+    const $ = (id) => document.getElementById(id);
+    const buildings = [];   // one plain object per building, used by the filters
+
+    Cesium.GeoJsonDataSource.load("Edited_DownTown.geojson").then((dataSource) => {
+      for (const entity of dataSource.entities.values) {
+        const p = entity.properties;
+        const b = {
+          entity,
+          stories: p.NUMBERSTORIES.getValue(),
+          heightFt: p["BUILDINGHEIGHT (ft)"].getValue(),
+          code: p.STRUCTURE.getValue(),
+          occupied: p.OCCUPIEDDATE.getValue(),
+          material: new Cesium.ColorMaterialProperty(),
+        };
+        b.group = Math.floor(b.code / 100);
+        buildings.push(b);
+
+        // Clean info box shown when a building is clicked.
+        const typeName = structureNames[b.code] || `Code ${b.code}`;
+        entity.name = typeName;
+        entity.description = `
+          <table class="cesium-infoBox-defaultTable"><tbody>
+            <tr><th>Stories</th><td>${b.stories}</td></tr>
+            <tr><th>Height</th><td>${b.heightFt} ft</td></tr>
+            <tr><th>Year occupied</th><td>${b.occupied ? b.occupied.slice(0, 4) : "Unknown"}</td></tr>
+            <tr><th>Structure type</th><td>${typeName}</td></tr>
+          </tbody></table>`;
+
+        // Turn each flat footprint into a 3D block sitting on the terrain.
+        const polygon = entity.polygon;
+        polygon.material = b.material;
+        polygon.outline = false; // outlines can't be drawn on terrain in Cesium
+        polygon.heightReference = Cesium.HeightReference.CLAMP_TO_GROUND;
+        polygon.extrudedHeightReference = Cesium.HeightReference.RELATIVE_TO_GROUND;
+        polygon.extrudedHeight = b.heightFt * FEET_TO_METERS;
+      }
+
+      setupControls();
+      viewer.dataSources.add(dataSource);
+      // Zoom to downtown, tilted so the building heights are visible.
+      viewer.flyTo(dataSource, {
+        offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-35), 0),
+      });
+    });
+
+    // ---------------------------------------------------------------------
+    // Controls
+    // ---------------------------------------------------------------------
+    let maxHeight, maxStories;
+    const defaultTypeColors = {};  // so "Reset all" can restore the type colors
+
+    function setupControls() {
+      maxHeight = Math.ceil(Math.max(...buildings.map((b) => b.heightFt)));
+      maxStories = Math.max(...buildings.map((b) => b.stories));
+      for (const id of ["hMin", "hMax"]) { $(id).min = 0; $(id).max = maxHeight; }
+      for (const id of ["sMin", "sMax"]) { $(id).min = 1; $(id).max = maxStories; }
+
+      // Stories legend (matches the QGIS legend).
+      $("storiesLegend").innerHTML = storyClasses.map((c) =>
+        `<label><span class="swatch" style="background:${c.color}"></span>${c.label}</label>`).join("");
+
+      // One row per building type found in the data: checkbox + color picker + count.
+      const groupsInData = [...new Set(buildings.map((b) => b.group))].sort();
+      $("typeList").innerHTML = groupsInData.map((g) => {
+        const n = buildings.filter((b) => b.group === g).length;
+        const info = typeGroups[g] || { label: `Other (${g}xx)`, color: "#a0a0a0" };
+        typeGroups[g] = info;
+        defaultTypeColors[g] = info.color;
+        return `<div class="typeRow">
+            <label><input type="checkbox" class="typeCheck" data-group="${g}" checked> ${info.label} (${n})</label>
+            <input type="color" class="typeColor" data-group="${g}" value="${info.color}" title="Change color">
+          </div>`;
+      }).join("");
+
+      // Redraw whenever any control changes.
+      $("controls").addEventListener("input", (e) => {
+        if (e.target.classList.contains("typeColor")) {
+          typeGroups[e.target.dataset.group].color = e.target.value;
+          if ($("colorMode").value !== "type") $("colorMode").value = "type"; // show the change
+        }
+        keepRangeOrder(e.target.id);
+        update();
+      });
+      $("reset").addEventListener("click", resetControls);
+      $("toggle").addEventListener("click", () => {
+        const collapsed = $("panel").classList.toggle("collapsed");
+        $("toggle").textContent = collapsed ? "Show" : "Hide";
+      });
+
+      resetControls();
+    }
+
+    // Stop a "Min" slider from passing its "Max" slider, and the other way round.
+    function keepRangeOrder(id) {
+      const pairs = { hMin: "hMax", sMin: "sMax", hMax: "hMin", sMax: "sMin" };
+      if (!pairs[id]) return;
+      const isMin = id.endsWith("Min");
+      const me = $(id), other = $(pairs[id]);
+      if (isMin && +me.value > +other.value) other.value = me.value;
+      if (!isMin && +me.value < +other.value) other.value = me.value;
+    }
+
+    function resetControls() {
+      $("colorMode").value = "stories";
+      $("singleColor").value = "#3388ff";
+      $("alpha").value = 0;
+      $("hMin").value = 0;  $("hMax").value = maxHeight;
+      $("sMin").value = 1;  $("sMax").value = maxStories;
+      document.querySelectorAll(".typeCheck").forEach((c) => (c.checked = true));
+      document.querySelectorAll(".typeColor").forEach((c) => {
+        c.value = defaultTypeColors[c.dataset.group];
+        typeGroups[c.dataset.group].color = c.value;
+      });
+      update();
+    }
+
+    // Apply the current colors and filters to every building.
+    function update() {
+      const mode = $("colorMode").value;
+      const alpha = 1 - $("alpha").value / 100;
+      const hMin = +$("hMin").value, hMax = +$("hMax").value;
+      const sMin = +$("sMin").value, sMax = +$("sMax").value;
+      const shownGroups = new Set([...document.querySelectorAll(".typeCheck:checked")]
+        .map((c) => +c.dataset.group));
+
+      $("singleColorRow").hidden = mode !== "single";
+      $("storiesLegend").hidden = mode !== "stories";
+      $("alphaOut").textContent = `${$("alpha").value}%`;
+      $("hMinOut").textContent = `${hMin} ft`;
+      $("hMaxOut").textContent = `${hMax} ft`;
+      $("sMinOut").textContent = sMin;
+      $("sMaxOut").textContent = sMax;
+
+      let shown = 0;
+      for (const b of buildings) {
+        const visible =
+          b.heightFt >= hMin && b.heightFt <= hMax &&
+          b.stories >= sMin && b.stories <= sMax &&
+          shownGroups.has(b.group);
+
+        b.entity.show = visible;
+        if (visible) shown++;
+        if (!visible && viewer.selectedEntity === b.entity) viewer.selectedEntity = undefined;
+
+        const css =
+          mode === "stories" ? storiesColor(b.stories) :
+          mode === "type"    ? typeGroups[b.group].color :
+                               $("singleColor").value;
+        b.material.color = Cesium.Color.fromCssColorString(css).withAlpha(alpha);
+      }
+      $("count").textContent = `Showing ${shown} of ${buildings.length} buildings`;
+    }
+  </script>
+</body>
+</html>
