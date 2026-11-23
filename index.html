@@ -82,11 +82,13 @@
 
   <script>
     // Your Cesium ion token (ion.cesium.com -> Access Tokens).
+    // The deploy workflow (.github/workflows/deploy.yml) swaps the
+    // placeholder below for the CESIUM_TOKEN repository secret.
     // Anyone can read it on a public page, so in the ion dashboard
     // restrict it to your GitHub Pages URL before publishing.
     // Without a token you get a flat globe.
     // Token "SF_Orditus_GitHub" expires May 17, 2027: make a new one before then.
-    const token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6Im1Wa1NOZTF5dmdoVUdkM1UiLCJqdGkiOiJhMWNhMGJmOC1jODkxLTRkMGItODg1Mi1lNDIzYWJmNjA3ZGEiLCJpZCI6NTQ2NzUwLCJzdWIiOiJUYm9uZTA5MzUiLCJpc3MiOiJodHRwczovL2FwaS5jZXNpdW0uY29tIiwiYXVkIjoiU0ZfT3JkaXR1c19HaXRIdWIiLCJpYXQiOjE3OTQ5NTU3NTgsImV4cCI6MTgxMDU4OTkzM30.F4_5YDS3jxNEj-UXrEDLNqG6OSvuyPAoacYyWDFdHjU";
+    const token = "PASTE_CESIUM_TOKEN"; // replaced at deploy time by GitHub Actions (secret CESIUM_TOKEN)
     const hasToken = !token.startsWith("PASTE");
     if (hasToken) Cesium.Ion.defaultAccessToken = token;
 
@@ -188,7 +190,83 @@
     const $ = (id) => document.getElementById(id);
     const buildings = [];   // one plain object per building, used by the filters
 
-    Cesium.GeoJsonDataSource.load("Edited_DownTown.geojson").then((dataSource) => {
+    // Live data from the City of Sioux Falls GIS server, pulled on every visit.
+    // This is the JavaScript version of get_buildings.py plus the QGIS edits.
+    const BOUNDARY_URL = "https://gis.siouxfalls.gov/arcgis/rest/services/Data/Community/MapServer/6"; // Downtown Business District
+    const LAYER_URL = "https://gis.siouxfalls.gov/arcgis/rest/services/Data/Property/MapServer/5";     // building footprints
+    const PAGE_SIZE = 1000; // the server's maximum per request
+
+    // POST rather than GET: the boundary polygon is too long to fit in a URL.
+    async function query(layerUrl, params) {
+      const resp = await fetch(layerUrl + "/query", { method: "POST", body: new URLSearchParams(params) });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${layerUrl}`);
+      const json = await resp.json();
+      if (json.error) throw new Error(`Server error: ${JSON.stringify(json.error)}`);
+      return json;
+    }
+
+    async function getBoundary() {
+      // The server errors without outFields, so ask for just the ID.
+      const result = await query(BOUNDARY_URL, { where: "1=1", outFields: "OBJECTID", outSR: 4326, f: "json" });
+      if ((result.features || []).length !== 1)
+        throw new Error(`Expected 1 boundary shape, got ${(result.features || []).length}`);
+      return result.features[0].geometry;
+    }
+
+    async function fetchBuildings() {
+      const boundary = await getBoundary();
+      const features = [];
+      while (true) {
+        const page = await query(LAYER_URL, {
+          where: "1=1",
+          outFields: "*",
+          orderByFields: "OBJECTID", // fixed order so paging is consistent
+          resultOffset: features.length,
+          resultRecordCount: PAGE_SIZE,
+          outSR: 4326,
+          f: "geojson",
+          geometry: JSON.stringify(boundary),
+          geometryType: "esriGeometryPolygon",
+          inSR: 4326,
+          spatialRel: "esriSpatialRelIntersects", // buildings touching the edge are kept too
+        });
+        const batch = page.features || [];
+        features.push(...batch);
+        if (batch.length < PAGE_SIZE) break;
+      }
+      return features;
+    }
+
+    // The edits that used to be done by hand in QGIS.
+    function cleanBuildings(features) {
+      const kept = [];
+      for (const f of features) {
+        const p = f.properties;
+        // Drop buildings with no height or stories (the City's "Proposed"
+        // placeholders): there's nothing to draw for them.
+        if (typeof p.BUILDINGTOPELEVATION !== "number" ||
+            typeof p.GROUNDELEVATION !== "number" ||
+            typeof p.NUMBERSTORIES !== "number") continue;
+
+        // Elevations are in feet above sea level; height = top - ground, to 0.01 ft (as in QGIS).
+        p["GROUNDELEVATION (ft)"] = p.GROUNDELEVATION;
+        p["BUILDINGTOPELEVATION (ft)"] = p.BUILDINGTOPELEVATION;
+        p["BUILDINGHEIGHT (ft)"] = Math.round((p.BUILDINGTOPELEVATION - p.GROUNDELEVATION) * 100) / 100;
+        delete p.GROUNDELEVATION;
+        delete p.BUILDINGTOPELEVATION;
+
+        // Dates arrive as milliseconds since 1970; turn them into YYYY-MM-DD.
+        if (typeof p.OCCUPIEDDATE === "number")
+          p.OCCUPIEDDATE = new Date(p.OCCUPIEDDATE).toISOString().slice(0, 10);
+
+        kept.push(f);
+      }
+      return { type: "FeatureCollection", features: kept };
+    }
+
+    fetchBuildings()
+      .then((features) => Cesium.GeoJsonDataSource.load(cleanBuildings(features)))
+      .then((dataSource) => {
       for (const entity of dataSource.entities.values) {
         const p = entity.properties;
         const b = {
@@ -228,6 +306,10 @@
       viewer.flyTo(dataSource, {
         offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-35), 0),
       });
+    })
+    .catch((err) => {
+      console.error(err);
+      $("count").textContent = "Couldn't load buildings from the City of Sioux Falls server. Try reloading the page.";
     });
 
     // ---------------------------------------------------------------------
