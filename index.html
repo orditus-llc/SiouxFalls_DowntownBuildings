@@ -34,6 +34,32 @@
     #panel .typeRow label { flex: 1; }
     #toggle { width: auto !important; padding: 1px 8px !important; }
     #panel.collapsed #controls { display: none; }
+
+    /* ---- Two-handle range slider: two range inputs stacked on one track ---- */
+    .dual { position: relative; height: 22px; }
+    .dual::before, .dual .fill {
+      content: ""; position: absolute; top: 50%; height: 4px; margin-top: -2px; border-radius: 2px;
+    }
+    .dual::before { left: 0; right: 0; background: #ccc; }      /* full track */
+    .dual .fill { background: #3388ff; }                           /* selected part */
+    #panel .dual input[type=range] {
+      position: absolute; left: 0; top: 0; width: 100%; height: 22px; margin: 0;
+      background: none; pointer-events: none;                      /* only the handles are clickable */
+      -webkit-appearance: none; appearance: none;
+    }
+    .dual input[type=range]::-webkit-slider-runnable-track { height: 4px; background: transparent; }
+    .dual input[type=range]::-moz-range-track { height: 4px; background: transparent; }
+    .dual input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; pointer-events: auto; cursor: pointer;
+      width: 16px; height: 16px; margin-top: -6px; border-radius: 50%;
+      background: #fff; border: 2px solid #3388ff; box-sizing: border-box;
+    }
+    .dual input[type=range]::-moz-range-thumb {
+      pointer-events: auto; cursor: pointer;
+      width: 16px; height: 16px; border-radius: 50%;
+      background: #fff; border: 2px solid #3388ff; box-sizing: border-box;
+    }
+    #panel .allRow { font-weight: bold; }
     [hidden] { display: none !important; }  /* keep hidden items hidden, even flex labels */
   </style>
 </head>
@@ -60,16 +86,20 @@
       <input type="range" id="alpha" min="0" max="80" step="5" value="0">
 
       <h3>Building height (ft)</h3>
-      <div class="row"><span>Min</span><span id="hMinOut"></span></div>
-      <input type="range" id="hMin" step="1">
-      <div class="row"><span>Max</span><span id="hMaxOut"></span></div>
-      <input type="range" id="hMax" step="1">
+      <div class="row"><span>Range</span><span id="hOut"></span></div>
+      <div class="dual">
+        <div class="fill" id="hFill"></div>
+        <input type="range" id="hMin" step="1" aria-label="Minimum height">
+        <input type="range" id="hMax" step="1" aria-label="Maximum height">
+      </div>
 
       <h3>Number of stories</h3>
-      <div class="row"><span>Min</span><span id="sMinOut"></span></div>
-      <input type="range" id="sMin" step="1">
-      <div class="row"><span>Max</span><span id="sMaxOut"></span></div>
-      <input type="range" id="sMax" step="1">
+      <div class="row"><span>Range</span><span id="sOut"></span></div>
+      <div class="dual">
+        <div class="fill" id="sFill"></div>
+        <input type="range" id="sMin" step="1" aria-label="Minimum stories">
+        <input type="range" id="sMax" step="1" aria-label="Maximum stories">
+      </div>
 
       <h3>Building type</h3>
       <div class="muted">Uncheck to hide. Click a color box to change that type's color.</div>
@@ -194,6 +224,8 @@
     // This is the JavaScript version of get_buildings.py plus the QGIS edits.
     const BOUNDARY_URL = "https://gis.siouxfalls.gov/arcgis/rest/services/Data/Community/MapServer/6"; // Downtown Business District
     const LAYER_URL = "https://gis.siouxfalls.gov/arcgis/rest/services/Data/Property/MapServer/5";     // building footprints
+    const ADDRESS_URL = "https://gis.siouxfalls.gov/arcgis/rest/services/Data/Property/MapServer/0";   // address points: business name (ALIAS), YEARBUILT
+    const PARCEL_URL = "https://gis.siouxfalls.gov/arcgis/rest/services/Data/Property/MapServer/1";    // parcels: owner name (OWNNAME1)
     const PAGE_SIZE = 1000; // the server's maximum per request
 
     // POST rather than GET: the boundary polygon is too long to fit in a URL.
@@ -213,13 +245,13 @@
       return result.features[0].geometry;
     }
 
-    async function fetchBuildings() {
-      const boundary = await getBoundary();
+    // Every feature of a layer inside the downtown boundary, as GeoJSON features.
+    async function fetchLayer(layerUrl, boundary, outFields) {
       const features = [];
       while (true) {
-        const page = await query(LAYER_URL, {
+        const page = await query(layerUrl, {
           where: "1=1",
-          outFields: "*",
+          outFields,
           orderByFields: "OBJECTID", // fixed order so paging is consistent
           resultOffset: features.length,
           resultRecordCount: PAGE_SIZE,
@@ -264,9 +296,89 @@
       return { type: "FeatureCollection", features: kept };
     }
 
-    fetchBuildings()
-      .then((features) => Cesium.GeoJsonDataSource.load(cleanBuildings(features)))
-      .then((dataSource) => {
+    // ---- Matching names, owners and build years to each building ----
+
+    // Is point [lon, lat] inside a GeoJSON Polygon or MultiPolygon? (ray casting; holes handled)
+    function pointInGeometry([x, y], geom) {
+      if (!geom) return false;
+      const polygons = geom.type === "Polygon" ? [geom.coordinates] :
+                       geom.type === "MultiPolygon" ? geom.coordinates : [];
+      return polygons.some((rings) => {
+        let inside = false;
+        for (const ring of rings) {
+          for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+            const [xi, yi] = ring[i], [xj, yj] = ring[j];
+            if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+          }
+        }
+        return inside;
+      });
+    }
+
+    // A point near the middle of a building (average of its outline's corners).
+    function centerOf(geom) {
+      const ring = geom.type === "Polygon" ? geom.coordinates[0] : geom.coordinates[0][0];
+      const pts = ring.slice(0, -1); // the last corner repeats the first
+      return [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
+    }
+
+    const unique = (list) => [...new Set(list.filter((v) => v && String(v).trim()))];
+
+    // For every building: names, addresses, build year (address points) and owners (parcels).
+    // Returns a Map of building OBJECTID -> info.
+    function matchBuildingInfo(buildingFeatures, addressPoints, parcels) {
+      const info = new Map();
+      for (const f of buildingFeatures) {
+        const center = centerOf(f.geometry);
+
+        // Parcel(s) under the middle of the building. Condos can stack several parcels on one spot.
+        const myParcels = parcels.filter((pc) => pointInGeometry(center, pc.geometry));
+
+        // Address points inside the footprint; if none, the address points on the same parcel.
+        let myAddresses = addressPoints.filter((a) => a.geometry && pointInGeometry(a.geometry.coordinates, f.geometry));
+        if (!myAddresses.length) {
+          const tags = new Set(myParcels.map((pc) => pc.properties.TAG));
+          myAddresses = addressPoints.filter((a) => tags.has(a.properties.TAG));
+        }
+
+        const years = myAddresses.map((a) => parseInt(a.properties.YEARBUILT, 10)).filter((y) => y > 1800);
+        info.set(f.properties.OBJECTID, {
+          names: unique(myAddresses.map((a) => a.properties.ALIAS)),
+          addresses: unique(myAddresses.map((a) => a.properties.ADDRESS).concat(myParcels.map((pc) => pc.properties.ADDRESS))),
+          owners: unique(myParcels.map((pc) => pc.properties.OWNNAME1)),
+          yearBuilt: years.length ? Math.min(...years) : null,
+        });
+      }
+      return info;
+    }
+
+    // Make text from the City's data safe to put inside the info box HTML.
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+    // Show up to `max` items, then "+ N more".
+    function listHtml(items, max) {
+      if (!items.length) return "Unknown";
+      const shown = items.slice(0, max).map(esc).join("<br>");
+      return items.length > max ? `${shown}<br><i>+ ${items.length - max} more</i>` : shown;
+    }
+
+    async function loadEverything() {
+      const boundary = await getBoundary();
+      // Names and owners are extras: if those layers fail, still show the buildings.
+      const optional = (promise, what) => promise.catch((err) => { console.warn(`Couldn't load ${what}:`, err); return []; });
+      const [buildingFeatures, addressPoints, parcels] = await Promise.all([
+        fetchLayer(LAYER_URL, boundary, "*"),
+        optional(fetchLayer(ADDRESS_URL, boundary, "TAG,ADDRESS,ALIAS,YEARBUILT"), "address points"),
+        optional(fetchLayer(PARCEL_URL, boundary, "TAG,ADDRESS,OWNNAME1"), "parcels"),
+      ]);
+      const cleaned = cleanBuildings(buildingFeatures);
+      const info = matchBuildingInfo(cleaned.features, addressPoints, parcels);
+      const dataSource = await Cesium.GeoJsonDataSource.load(cleaned);
+      return { dataSource, info };
+    }
+
+    loadEverything()
+      .then(({ dataSource, info }) => {
       for (const entity of dataSource.entities.values) {
         const p = entity.properties;
         const b = {
@@ -282,12 +394,19 @@
 
         // Clean info box shown when a building is clicked.
         const typeName = structureNames[b.code] || `Code ${b.code}`;
-        entity.name = typeName;
+        const extra = info.get(p.OBJECTID.getValue()) || { names: [], addresses: [], owners: [], yearBuilt: null };
+        const built =
+          extra.yearBuilt ? extra.yearBuilt :
+          b.occupied      ? `${b.occupied.slice(0, 4)} (year occupied)` : "Unknown";
+        entity.name = extra.names[0] || typeName;  // title of the info box
         entity.description = `
           <table class="cesium-infoBox-defaultTable"><tbody>
+            <tr><th>Building / business</th><td>${listHtml(extra.names, 4)}</td></tr>
+            <tr><th>Owner</th><td>${listHtml(extra.owners, 3)}</td></tr>
+            <tr><th>Year built</th><td>${built}</td></tr>
+            <tr><th>Address</th><td>${listHtml(extra.addresses, 2)}</td></tr>
             <tr><th>Stories</th><td>${b.stories}</td></tr>
             <tr><th>Height</th><td>${b.heightFt} ft</td></tr>
-            <tr><th>Year occupied</th><td>${b.occupied ? b.occupied.slice(0, 4) : "Unknown"}</td></tr>
             <tr><th>Structure type</th><td>${typeName}</td></tr>
           </tbody></table>`;
 
@@ -329,8 +448,11 @@
         `<label><span class="swatch" style="background:${c.color}"></span>${c.label}</label>`).join("");
 
       // One row per building type found in the data: checkbox + color picker + count.
+      // An "All" checkbox first, to check or uncheck every type at once.
       const groupsInData = [...new Set(buildings.map((b) => b.group))].sort();
-      $("typeList").innerHTML = groupsInData.map((g) => {
+      $("typeList").innerHTML =
+        `<label class="allRow"><input type="checkbox" id="typeAll" checked> All (${buildings.length})</label>` +
+        groupsInData.map((g) => {
         const n = buildings.filter((b) => b.group === g).length;
         const info = typeGroups[g] || { label: `Other (${g}xx)`, color: "#a0a0a0" };
         typeGroups[g] = info;
@@ -343,6 +465,9 @@
 
       // Redraw whenever any control changes.
       $("controls").addEventListener("input", (e) => {
+        if (e.target.id === "typeAll") {
+          document.querySelectorAll(".typeCheck").forEach((c) => (c.checked = e.target.checked));
+        }
         if (e.target.classList.contains("typeColor")) {
           typeGroups[e.target.dataset.group].color = e.target.value;
           if ($("colorMode").value !== "type") $("colorMode").value = "type"; // show the change
@@ -359,14 +484,28 @@
       resetControls();
     }
 
-    // Stop a "Min" slider from passing its "Max" slider, and the other way round.
+    // Two-handle sliders: stop a handle from passing the other one.
     function keepRangeOrder(id) {
       const pairs = { hMin: "hMax", sMin: "sMax", hMax: "hMin", sMax: "sMin" };
       if (!pairs[id]) return;
       const isMin = id.endsWith("Min");
       const me = $(id), other = $(pairs[id]);
-      if (isMin && +me.value > +other.value) other.value = me.value;
-      if (!isMin && +me.value < +other.value) other.value = me.value;
+      if (isMin && +me.value > +other.value) me.value = other.value;
+      if (!isMin && +me.value < +other.value) me.value = other.value;
+    }
+
+    // Draw the blue part between the two handles, and make sure a handle can
+    // still be grabbed when both sit on the same spot.
+    function drawDualSlider(minId, maxId, fillId) {
+      const lo = $(minId), hi = $(maxId);
+      const span = (+lo.max - +lo.min) || 1;
+      const a = (+lo.value - +lo.min) / span, b = (+hi.value - +lo.min) / span;
+      const thumb = 16; // px, matches the CSS handle size
+      $(fillId).style.left = `calc(${a * 100}% + ${thumb / 2 - thumb * a}px)`;
+      $(fillId).style.width = `calc(${(b - a) * 100}% - ${thumb * (b - a)}px)`;
+      // Handles stacked at the far right: put "min" on top so it can be dragged back left.
+      lo.style.zIndex = +lo.value >= +lo.max ? 2 : 1;
+      hi.style.zIndex = 1;
     }
 
     function resetControls() {
@@ -389,16 +528,20 @@
       const alpha = 1 - $("alpha").value / 100;
       const hMin = +$("hMin").value, hMax = +$("hMax").value;
       const sMin = +$("sMin").value, sMax = +$("sMax").value;
-      const shownGroups = new Set([...document.querySelectorAll(".typeCheck:checked")]
-        .map((c) => +c.dataset.group));
+      const checks = [...document.querySelectorAll(".typeCheck")];
+      const shownGroups = new Set(checks.filter((c) => c.checked).map((c) => +c.dataset.group));
+
+      // "All" is checked when every type is, and shows a dash when only some are.
+      $("typeAll").checked = shownGroups.size === checks.length;
+      $("typeAll").indeterminate = shownGroups.size > 0 && shownGroups.size < checks.length;
 
       $("singleColorRow").hidden = mode !== "single";
       $("storiesLegend").hidden = mode !== "stories";
       $("alphaOut").textContent = `${$("alpha").value}%`;
-      $("hMinOut").textContent = `${hMin} ft`;
-      $("hMaxOut").textContent = `${hMax} ft`;
-      $("sMinOut").textContent = sMin;
-      $("sMaxOut").textContent = sMax;
+      $("hOut").textContent = `${hMin} – ${hMax} ft`;
+      $("sOut").textContent = sMin === sMax ? `${sMin}` : `${sMin} – ${sMax}`;
+      drawDualSlider("hMin", "hMax", "hFill");
+      drawDualSlider("sMin", "sMax", "sFill");
 
       let shown = 0;
       for (const b of buildings) {
